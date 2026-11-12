@@ -1,0 +1,30 @@
+Next Token Skill
+Copyright 2026 Next Token｜词元之外
+
+本仓库中的代码与说明文档（包括 SKILL.md、scripts/ 下的脚本和 README）
+以 Apache License 2.0 授权，详见 LICENSE 文件。
+
+以下内容不在上述许可范围内，版权归 Next Token 及各位主理人所有，保留所有权利：
+
+  1. Next Token 播客的节目音视频、逐字稿、博客文章和 Wiki 资料。
+     这些内容不包含在本仓库中，由脚本在运行时从 https://nexttoken.tv 获取，
+     并缓存在使用者本机，仅供使用者个人检索和阅读。
+  2. “Next Token”“词元之外”的名称、标识和其他品牌素材。
+
+允许的使用方式：在回答、文章或作品中简短引用节目内容，并注明出处、
+附上指向 nexttoken.tv 或对应视频的链接。
+
+未经许可，请勿批量转载、再分发节目内容，或将其用于训练数据集的公开发布。
+如需其他用途，请通过 https://nexttoken.tv 联系我们。
+
+---
+
+The code and documentation in this repository are licensed under the
+Apache License, Version 2.0 (see LICENSE).
+
+Podcast content (audio, video, transcripts, blog articles, wiki data) and the
+"Next Token" name and brand assets are NOT covered by that license. They are
+copyright Next Token and its hosts, all rights reserved. Content is fetched
+from https://nexttoken.tv at runtime and cached locally for the user's own
+search and reading. Short quotations with attribution and a link are welcome;
+bulk republication or redistribution requires permission.
