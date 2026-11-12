@@ -22,7 +22,7 @@
 把仓库克隆下来，再把 `next-token` 目录链接到 Claude Code 的 skills 目录：
 
 ```bash
-git clone <仓库地址> next-token-skill
+git clone https://github.com/next-token-tv/next-token-skill.git next-token-skill
 ```
 
 ```bash
