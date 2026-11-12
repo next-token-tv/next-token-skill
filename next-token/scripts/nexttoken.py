@@ -6,6 +6,7 @@ B 站 / YouTube 时间戳直跳链接的 Markdown 引用。
 
 用法:
   nexttoken.py search 词1 词2 ... [--speaker 名字] [--episode 009] [--limit 5] [--context 1]
+  nexttoken.py brief 词1 [词2 ...]       一次拿到某个专题的全部材料（做分析、调研时用）
   nexttoken.py timeline 词1 [词2 ...]    某个话题在各期里的说法，按时间排列
   nexttoken.py episodes                 列出所有节目与章节
   nexttoken.py read 009 [章节号]         读某期的章节列表，或某一章全文
@@ -450,6 +451,8 @@ def search(db, terms, speaker=None, episode=None, limit=5, context=1):
     for s, i in final:
         if any(rows[i]["ep"] == rows[j]["ep"] and abs(i - j) <= 2 * context + 1 for j in picked):
             continue
+        if not episode and sum(1 for j in picked if rows[j]["ep"] == rows[i]["ep"]) >= 2:
+            continue  # 同一期最多两条，让结果覆盖更多期
         picked.append(i)
         span = [j for j in range(i - context, i + context + 1) if same(i, j)]
         results.append({"score": round(s, 2), "hit_id": rows[i]["id"], "paras": [rows[j] for j in span]})
@@ -482,6 +485,50 @@ def search_blog(db, terms, limit=2):
     ranked = sorted(((v["total"] * (1 + 0.6 * (len(v["terms"]) - 1)), k) for k, v in per.items()
                      if len(v["terms"]) >= need), reverse=True)
     return [(arts[k], rows[per[k]["best"]]) for _, k in ranked[:limit]]
+
+
+def brief(db, terms, chapters=6, per_chapter=3):
+    """专题材料：找出讨论这个话题最集中的章节，每章给几段不同主理人的代表性发言。"""
+    rows, ents, low, elinks = load_corpus(db)
+    weighted, _ = weigh(terms, low, elinks, ents, weak=False)
+    if not weighted:
+        return None
+    score, matched = base_scores(weighted, len(rows))
+    by_ep, by_ch = {}, {}
+    for i, r in enumerate(rows):
+        if score[i]:
+            by_ep[r["ep"]] = by_ep.get(r["ep"], 0) + 1
+            c = by_ch.setdefault((r["ep"], r["chapter_no"]), {"idx": [], "total": 0.0, "terms": set()})
+            c["idx"].append(i)
+            c["total"] += score[i]
+            c["terms"] |= matched[i]
+    ranked = sorted(by_ch.items(), key=lambda kv: kv[1]["total"] * (1 + 0.3 * (len(kv[1]["terms"]) - 1)), reverse=True)
+    # 按分数从高到低选章节；同一期最多两章，让材料覆盖更多期
+    chosen = []
+    for key, c in ranked:
+        if len(chosen) >= chapters:
+            break
+        if len(c["idx"]) >= 3 and sum(1 for k in chosen if k[0] == key[0]) < 2:
+            chosen.append(key)
+    if not chosen:
+        chosen = [key for key, _ in ranked[:chapters]]
+    out = []
+    for key in sorted(chosen):
+        c = by_ch[key]
+        picked, speakers = [], {}
+        cand = sorted(c["idx"], key=lambda i: score[i] * short_penalty(rows[i]["text"]), reverse=True)
+        while cand and len(picked) < per_chapter:
+            # 已经出现过的主理人降权，尽量让每个人的说法都露出来
+            best = max(cand, key=lambda i: score[i] * short_penalty(rows[i]["text"]) * 0.5 ** speakers.get(rows[i]["speaker"], 0))
+            cand.remove(best)
+            if any(abs(best - j) <= 1 for j in picked):
+                continue
+            picked.append(best)
+            speakers[rows[best]["speaker"]] = speakers.get(rows[best]["speaker"], 0) + 1
+        first = min(i for i, r in enumerate(rows) if r["ep"] == key[0] and r["chapter_no"] == key[1])
+        out.append({"ep": key[0], "chapter_no": key[1], "count": len(c["idx"]), "first": rows[first],
+                    "paras": [rows[i] for i in sorted(picked)]})
+    return {"episodes": by_ep, "chapters": out}
 
 
 def timeline(db, terms, per_ep=2):
@@ -542,6 +589,28 @@ def print_blog(db, arts):
         if refs:
             print("  - 文章引用的节目位置：" + "；".join(refs[:4]))
     print()
+
+
+def print_brief(db, b, terms, arts):
+    if not b:
+        print(f"没有在 Next Token 节目里找到 {' / '.join(terms)}。可以换个名字（英文名、简称、产品名）再试。")
+        return
+    eps = ep_map(db)
+    print(f"# 专题材料：{' / '.join(terms)}\n")
+    print("## 哪些期聊过\n")
+    for num in sorted(b["episodes"]):
+        print(f"- #{num}《{eps[num]['title']}》· {eps[num]['date']} · 提到 {b['episodes'][num]} 段")
+    print("\n## 讨论最集中的章节\n")
+    for c in b["chapters"]:
+        e = eps[c["ep"]]
+        print(f"### #{c['ep']} 第 {c['chapter_no']} 章 {c['first']['chapter']} · {e['date']} · 提到 {c['count']} 段")
+        print(f"章节开头：{links(c['first'])}　全文：`read {c['ep']} {c['chapter_no']}`\n")
+        for p in c["paras"]:
+            print(f"- **{p['speaker']}**（{links(p)}）：{p['text']}")
+        print()
+    print_blog(db, arts)
+    print("以上是每章最相关的几段，不是全部。写分析前，至少用 read 读完其中最相关的一到两章，再动笔。")
+    print("引用时照抄上面的链接，不要自己改时间戳；带“约”的时间是近似位置。")
 
 
 def print_timeline(db, tl, terms):
@@ -623,6 +692,9 @@ def main():
     s.add_argument("--limit", type=int, default=5)
     s.add_argument("--context", type=int, default=1, help="命中段落前后各带几段上下文")
     s.add_argument("--no-blog", action="store_true", help="不附带相关博客文章")
+    bp = sub.add_parser("brief", help="一次拿到某个专题的全部材料")
+    bp.add_argument("terms", nargs="+", help="专题的核心词和别名，如：游戏 小游戏 网页游戏")
+    bp.add_argument("--chapters", type=int, default=6, help="最多列几个章节")
     t = sub.add_parser("timeline", help="某个话题在各期里的说法，按时间排列")
     t.add_argument("terms", nargs="+", help="同一个话题的不同叫法，如：Muse 缪斯")
     t.add_argument("--per-episode", type=int, default=2, help="每期最多列几段")
@@ -645,6 +717,8 @@ def main():
     if a.cmd == "search":
         arts = [] if (a.no_blog or a.speaker or a.episode) else search_blog(db, a.terms)
         print_results(db, search(db, a.terms, a.speaker, a.episode, a.limit, a.context), a.terms, arts)
+    elif a.cmd == "brief":
+        print_brief(db, brief(db, a.terms, a.chapters), a.terms, search_blog(db, a.terms, limit=3))
     elif a.cmd == "timeline":
         print_timeline(db, timeline(db, a.terms, a.per_episode), a.terms)
     elif a.cmd == "episodes":
