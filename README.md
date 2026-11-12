@@ -101,6 +101,7 @@ python3 next-token/scripts/nexttoken.py timeline Muse
 |---|---|
 | `search 词1 词2 ...` | 检索逐字稿和文章。可加 `--speaker 歸藏`、`--episode 009`、`--limit`、`--context` |
 | `brief 词1 ...` | 一个专题的全部材料：哪些期聊过、重点章节、代表发言、相关文章 |
+| `related 词1 ...` | 这个话题在节目里和哪些产品、公司、概念一起出现 |
 | `timeline 词1 ...` | 一个话题在各期里的说法，按时间排列 |
 | `episodes` | 列出所有节目和章节 |
 | `read 期号 [章节号]` | 读某期的章节列表，或某一章全文 |

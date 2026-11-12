@@ -7,12 +7,14 @@ B 站 / YouTube 时间戳直跳链接的 Markdown 引用。
 用法:
   nexttoken.py search 词1 词2 ... [--speaker 名字] [--episode 009] [--limit 5] [--context 1]
   nexttoken.py brief 词1 [词2 ...]       一次拿到某个专题的全部材料（做分析、调研时用）
+  nexttoken.py related 词1 [词2 ...]     这个话题在节目里和哪些产品、公司、概念一起出现
   nexttoken.py timeline 词1 [词2 ...]    某个话题在各期里的说法，按时间排列
   nexttoken.py episodes                 列出所有节目与章节
   nexttoken.py read 009 [章节号]         读某期的章节列表，或某一章全文
   nexttoken.py sync [--full]            手动同步（平时会自动同步）
 """
 import argparse
+import collections
 import html as htmllib
 import json
 import math
@@ -36,6 +38,11 @@ BLOG_INTERVAL = 24 * 3600  # 博客文章每天最多刷新一次
 VOID = {"img", "input", "br", "hr", "meta", "link", "source", "wbr"}
 WIKI = ["terms", "brands", "products", "people"]
 CJK = "一-鿿"
+# 带这些词的段落更可能是在下判断，而不是在报新闻或应和
+OPINION = re.compile("我觉得|我认为|我的判断|我的感觉|核心|本质|关键|意味着|问题是|原因是|为什么|趋势|机会|未来|所以|其实|但是|反而|不是.{1,12}而是")
+TYPE_NAMES = {"brands": "品牌", "products": "产品", "people": "人物", "terms": "术语"}
+SELF_LINKS = {"/wiki/brands/next-token", "/wiki/people/yangpan", "/wiki/people/guizang",
+              "/wiki/people/orange", "/wiki/people/xiangyang-qiaomu"}
 # 把中文长句拆成二字词时，用这些虚词断开
 STOP = "[的了是在和就都也很会能要说吗呢吧啊么怎什这那我你他她它们有没不与及或被把对从到给让]"
 
@@ -154,13 +161,16 @@ def connect():
     HOME.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB)
     db.row_factory = sqlite3.Row
+    cols = [r[1] for r in db.execute("PRAGMA table_info(entities)")]
+    if cols and "label" not in cols:
+        db.execute("DROP TABLE entities")  # 旧版本的表，重建后会自动重新同步
     db.executescript("""
     CREATE TABLE IF NOT EXISTS episodes(num TEXT PRIMARY KEY, title TEXT, date TEXT, url TEXT, fetched_at REAL);
     CREATE TABLE IF NOT EXISTS paras(id INTEGER PRIMARY KEY, ep TEXT, seq INTEGER, chapter_no INTEGER,
       chapter TEXT, speaker TEXT, slug TEXT, qid TEXT, text TEXT, exact INTEGER,
       bili TEXT, yt TEXT, entities TEXT);
     CREATE INDEX IF NOT EXISTS paras_ep ON paras(ep, seq);
-    CREATE TABLE IF NOT EXISTS entities(href TEXT PRIMARY KEY, names TEXT);
+    CREATE TABLE IF NOT EXISTS entities(href TEXT PRIMARY KEY, names TEXT, type TEXT, label TEXT, summary TEXT);
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS articles(slug TEXT PRIMARY KEY, title TEXT, date TEXT, summary TEXT, url TEXT);
     CREATE TABLE IF NOT EXISTS blog(id INTEGER PRIMARY KEY, slug TEXT, seq INTEGER, heading TEXT, text TEXT);
@@ -215,8 +225,11 @@ def sync_wiki(db):
             href = re.sub(r"^https?://[^/]+", "", e.get("url") or "")
             names = list((e.get("name") or {}).values()) + list(e.get("aliases") or []) + [e.get("id") or ""]
             names = sorted({n.strip().lower() for n in names if n and n.strip()})
+            name, summ = e.get("name") or {}, e.get("summary") or {}
             if href:
-                db.execute("INSERT OR REPLACE INTO entities VALUES(?,?)", (href, "\n".join(names)))
+                db.execute("INSERT OR REPLACE INTO entities VALUES(?,?,?,?,?)",
+                           (href, "\n".join(names), col, name.get("zh-Hans") or name.get("en") or e.get("id") or "",
+                            summ.get("zh-Hans") or summ.get("en") or ""))
 
 
 class BlogParser(HTMLParser):
@@ -330,7 +343,8 @@ def sync(db, full=False):
 
 def ensure_fresh(db):
     empty = not db.execute("SELECT 1 FROM episodes LIMIT 1").fetchone()
-    if empty or time.time() - float(meta_get(db, "last_check", 0)) > CHECK_INTERVAL:
+    no_wiki = not db.execute("SELECT 1 FROM entities LIMIT 1").fetchone()
+    if empty or no_wiki or time.time() - float(meta_get(db, "last_check", 0)) > CHECK_INTERVAL:
         try:
             sync(db)
         except Exception as e:
@@ -418,6 +432,11 @@ def short_penalty(text):
     return min(1.0, 0.5 + len(text) / 80)  # 太短的应答句降权
 
 
+def opinion_boost(text):
+    """带判断性表达、且有一定长度的段落加分：它们更可能是观点，而不是新闻播报或应和。"""
+    return (1 + 0.15 * min(len(OPINION.findall(text)), 4)) * (1.15 if len(text) >= 120 else 1.0)
+
+
 def search(db, terms, speaker=None, episode=None, limit=5, context=1):
     rows, ents, low, elinks = load_corpus(db)
     n = len(rows)
@@ -443,7 +462,7 @@ def search(db, terms, speaker=None, episode=None, limit=5, context=1):
             continue  # 只碰上零星几个二字词的，不算命中
         s = score[i] + 0.5 * sum(score[j] for j in (i - 1, i + 1) if same(i, j))
         s *= 1 + 0.6 * (len(near) - 1)  # 多个不同的词在附近同时出现，加分
-        s *= short_penalty(rows[i]["text"])
+        s *= short_penalty(rows[i]["text"]) * opinion_boost(rows[i]["text"]) ** 0.5
         final.append((s, i))
     final.sort(reverse=True)
 
@@ -487,7 +506,7 @@ def search_blog(db, terms, limit=2):
     return [(arts[k], rows[per[k]["best"]]) for _, k in ranked[:limit]]
 
 
-def brief(db, terms, chapters=6, per_chapter=3):
+def brief(db, terms, chapters=6, per_chapter=4):
     """专题材料：找出讨论这个话题最集中的章节，每章给几段不同主理人的代表性发言。"""
     rows, ents, low, elinks = load_corpus(db)
     weighted, _ = weigh(terms, low, elinks, ents, weak=False)
@@ -516,10 +535,13 @@ def brief(db, terms, chapters=6, per_chapter=3):
     for key in sorted(chosen):
         c = by_ch[key]
         picked, speakers = [], {}
-        cand = sorted(c["idx"], key=lambda i: score[i] * short_penalty(rows[i]["text"]), reverse=True)
+        def worth(i):
+            return score[i] * short_penalty(rows[i]["text"]) * opinion_boost(rows[i]["text"])
+
+        cand = sorted(c["idx"], key=worth, reverse=True)
         while cand and len(picked) < per_chapter:
             # 已经出现过的主理人降权，尽量让每个人的说法都露出来
-            best = max(cand, key=lambda i: score[i] * short_penalty(rows[i]["text"]) * 0.5 ** speakers.get(rows[i]["speaker"], 0))
+            best = max(cand, key=lambda i: worth(i) * 0.5 ** speakers.get(rows[i]["speaker"], 0))
             cand.remove(best)
             if any(abs(best - j) <= 1 for j in picked):
                 continue
@@ -529,6 +551,40 @@ def brief(db, terms, chapters=6, per_chapter=3):
         out.append({"ep": key[0], "chapter_no": key[1], "count": len(c["idx"]), "first": rows[first],
                     "paras": [rows[i] for i in sorted(picked)]})
     return {"episodes": by_ep, "chapters": out}
+
+
+def related(db, terms, limit=12):
+    """这个话题在节目里和哪些产品、公司、人物、概念一起出现。返回 [(实体, 共同出现段数, [期号])]。"""
+    rows, ents, low, elinks = load_corpus(db)
+    weighted, _ = weigh(terms, low, elinks, ents, weak=False)
+    if not weighted:
+        return []
+    score, _ = base_scores(weighted, len(rows))
+    info = {r["href"]: r for r in db.execute("SELECT * FROM entities")}
+    own = set(SELF_LINKS)
+    for t in terms:
+        own |= expand_term(t, ents)[1]
+    gdf = collections.Counter(h for links_ in elinks for h in links_ if h)
+    cnt, eps = collections.Counter(), collections.defaultdict(set)
+    for i, r in enumerate(rows):
+        if not score[i]:
+            continue
+        near = set()
+        for j in (i - 1, i, i + 1):
+            if 0 <= j < len(rows) and rows[j]["ep"] == r["ep"] and rows[j]["chapter_no"] == r["chapter_no"]:
+                near |= elinks[j]
+        for h in near - own:
+            if h in info:
+                cnt[h] += 1
+                eps[h].add(r["ep"])
+    # 到处都出现的词（AI、Agent、Token）降权，留下和这个话题关系更专的
+    # 跨多期反复出现的更值得追；产品和公司比通用术语更能当线索
+    def weight(h):
+        w = cnt[h] / math.log(3 + gdf[h]) * (1 + 0.5 * (len(eps[h]) - 1))
+        return w * (0.5 if info[h]["type"] == "terms" else 1.0)
+
+    ranked = sorted((h for h in cnt if cnt[h] >= 2), key=weight, reverse=True)
+    return [(info[h], cnt[h], sorted(eps[h])) for h in ranked[:limit]]
 
 
 def timeline(db, terms, per_ep=2):
@@ -591,7 +647,17 @@ def print_blog(db, arts):
     print()
 
 
-def print_brief(db, b, terms, arts):
+def print_related(rel, header="## 这个话题连着的产品、公司和概念"):
+    if not rel:
+        return
+    print(header + "\n")
+    for e, n, eps in rel:
+        summ = f"：{e['summary']}" if e["summary"] else ""
+        print(f"- **{e['label']}**（{TYPE_NAMES.get(e['type'], e['type'])}，一起出现 {n} 段，{' '.join('#' + x for x in eps)}）{summ}")
+    print("\n想顺着某条线索往下挖：`search 话题词 上面的名字`，会优先返回两者同时出现的段落。\n")
+
+
+def print_brief(db, b, terms, arts, rel=()):
     if not b:
         print(f"没有在 Next Token 节目里找到 {' / '.join(terms)}。可以换个名字（英文名、简称、产品名）再试。")
         return
@@ -608,6 +674,7 @@ def print_brief(db, b, terms, arts):
         for p in c["paras"]:
             print(f"- **{p['speaker']}**（{links(p)}）：{p['text']}")
         print()
+    print_related(rel)
     print_blog(db, arts)
     print("以上是每章最相关的几段，不是全部。写分析前，至少用 read 读完其中最相关的一到两章，再动笔。")
     print("引用时照抄上面的链接，不要自己改时间戳；带“约”的时间是近似位置。")
@@ -695,6 +762,8 @@ def main():
     bp = sub.add_parser("brief", help="一次拿到某个专题的全部材料")
     bp.add_argument("terms", nargs="+", help="专题的核心词和别名，如：游戏 小游戏 网页游戏")
     bp.add_argument("--chapters", type=int, default=6, help="最多列几个章节")
+    rp = sub.add_parser("related", help="话题在节目里和哪些产品、公司、概念一起出现")
+    rp.add_argument("terms", nargs="+")
     t = sub.add_parser("timeline", help="某个话题在各期里的说法，按时间排列")
     t.add_argument("terms", nargs="+", help="同一个话题的不同叫法，如：Muse 缪斯")
     t.add_argument("--per-episode", type=int, default=2, help="每期最多列几段")
@@ -718,7 +787,14 @@ def main():
         arts = [] if (a.no_blog or a.speaker or a.episode) else search_blog(db, a.terms)
         print_results(db, search(db, a.terms, a.speaker, a.episode, a.limit, a.context), a.terms, arts)
     elif a.cmd == "brief":
-        print_brief(db, brief(db, a.terms, a.chapters), a.terms, search_blog(db, a.terms, limit=3))
+        print_brief(db, brief(db, a.terms, a.chapters), a.terms, search_blog(db, a.terms, limit=3),
+                    related(db, a.terms, limit=10))
+    elif a.cmd == "related":
+        rel = related(db, a.terms, limit=20)
+        if rel:
+            print_related(rel, f"# 和 {' / '.join(a.terms)} 一起出现的产品、公司和概念")
+        else:
+            print(f"没有找到和 {' / '.join(a.terms)} 一起出现的实体。")
     elif a.cmd == "timeline":
         print_timeline(db, timeline(db, a.terms, a.per_episode), a.terms)
     elif a.cmd == "episodes":
